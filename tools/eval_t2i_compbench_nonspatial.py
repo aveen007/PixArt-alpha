@@ -23,6 +23,7 @@ DATASET_ID = "Vertsineu/t2i-compbench"
 DATASET_REVISION = "6c46ce25085d29158b483395fd4d7d942835c9bd"
 DATASET_FILE = "non_spatial/validation-00000-of-00001.parquet"
 DEFAULT_MODEL_ID = "PixArt-alpha/PixArt-XL-2-512x512"
+DEFAULT_MODEL_REVISION = "50f702106901db6d0f8b67eb88e814c56ded2692"
 PAPER_SCORE = 0.3179
 
 
@@ -100,6 +101,8 @@ def generate_images(args):
         args.model,
         torch_dtype=torch.float16,
         use_safetensors=True,
+        revision=DEFAULT_MODEL_REVISION if args.model == DEFAULT_MODEL_ID else None,
+        token=False,
     )
     pipe.scheduler = DPMSolverMultistepScheduler.from_config(
         pipe.scheduler.config,
@@ -150,6 +153,7 @@ def generate_images(args):
                     "dataset": DATASET_ID,
                     "dataset_revision": DATASET_REVISION,
                     "model": args.model,
+                    "model_revision": DEFAULT_MODEL_REVISION if args.model == DEFAULT_MODEL_ID else None,
                     "height": args.height,
                     "width": args.width,
                     "steps": args.steps,
