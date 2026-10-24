@@ -1,9 +1,9 @@
-"""Export the exact text conditioning used by the lightweight baseline.
+"""Export active text-token conditioning used by the lightweight baseline.
 
-The output is a portable torch bundle containing the positive T5 hidden
-states for the 300 T2I-CompBench non-spatial prompts, their masks and token
-IDs, and the empty-prompt conditioning used by Diffusers for CFG.  The dense
-prompt embedding shape is [number of prompts, 120, 4096].
+The portable torch bundle stores only embeddings at positions where the T5
+attention mask is active. It retains masks, token IDs, sequence positions,
+row offsets, and the active empty-prompt conditioning used by Diffusers for
+CFG. Masked padding embeddings are intentionally omitted.
 """
 
 import argparse
@@ -88,6 +88,29 @@ def encode(pipe, prompts, device):
     return prompt_embeds, prompt_attention_mask
 
 
+def pack_active_metadata(attention_mask, input_ids):
+    active = attention_mask.bool()
+    counts = active.sum(dim=1, dtype=torch.int64)
+    row_offsets = torch.cat([torch.zeros(1, dtype=torch.int64), counts.cumsum(dim=0)])
+    positions = torch.nonzero(active, as_tuple=False)[:, 1].to(dtype=torch.int16)
+    active_input_ids = input_ids[active].to(dtype=torch.int64).contiguous()
+    return row_offsets, positions, active_input_ids
+
+
+def reconstruct_dense(active_embeddings, attention_mask):
+    """Zero-fill masked positions and scatter active embeddings in row-major order."""
+    expected_active = int(attention_mask.sum())
+    if active_embeddings.shape[0] != expected_active:
+        raise ValueError(
+            f"Expected {expected_active} active embeddings, found {active_embeddings.shape[0]}"
+        )
+    dense = active_embeddings.new_zeros(
+        attention_mask.shape[0], attention_mask.shape[1], active_embeddings.shape[-1]
+    )
+    dense[attention_mask.bool()] = active_embeddings
+    return dense
+
+
 def main():
     args = parse_args()
     if args.batch_size < 1:
@@ -148,7 +171,7 @@ def main():
     cleaned_prompts = pipe._text_preprocessing(prompts, clean_caption=True)
     prompt_tokens = tokenize(pipe, cleaned_prompts)
 
-    embedding_batches = []
+    active_embedding_batches = []
     mask_batches = []
     for offset in tqdm(range(0, len(prompts), args.batch_size), desc="Encoding prompts"):
         batch = prompts[offset : offset + args.batch_size]
@@ -156,29 +179,57 @@ def main():
         expected_mask = prompt_tokens.attention_mask[offset : offset + len(batch)]
         if not torch.equal(batch_mask.cpu(), expected_mask):
             raise RuntimeError(f"Attention-mask mismatch in batch starting at prompt {offset}")
-        embedding_batches.append(batch_embeds.to(device="cpu", dtype=torch.float16).contiguous())
-        mask_batches.append(batch_mask.to(device="cpu", dtype=torch.int64).contiguous())
+        if tuple(batch_embeds.shape[1:]) != (MAX_SEQUENCE_LENGTH, EXPECTED_HIDDEN_SIZE):
+            raise RuntimeError(f"Unexpected prompt embedding shape: {tuple(batch_embeds.shape)}")
+        batch_embeds = batch_embeds.to(device="cpu", dtype=torch.float16)
+        batch_mask = batch_mask.to(device="cpu", dtype=torch.int64)
+        active_embedding_batches.append(batch_embeds[batch_mask.bool()].contiguous())
+        mask_batches.append(batch_mask.contiguous())
 
-    prompt_embeds = torch.cat(embedding_batches, dim=0)
+    active_prompt_embeds = torch.cat(active_embedding_batches, dim=0)
     prompt_attention_mask = torch.cat(mask_batches, dim=0)
+    prompt_row_offsets, active_prompt_positions, active_prompt_input_ids = pack_active_metadata(
+        prompt_attention_mask, prompt_tokens.input_ids
+    )
 
     negative_prompt = ""
     cleaned_negative_prompt = pipe._text_preprocessing([negative_prompt], clean_caption=True)
     negative_tokens = tokenize(pipe, cleaned_negative_prompt)
-    negative_prompt_embeds, negative_prompt_attention_mask = encode(pipe, [negative_prompt], device)
-    negative_prompt_embeds = negative_prompt_embeds.to(
+    dense_negative_prompt_embeds, negative_prompt_attention_mask = encode(
+        pipe, [negative_prompt], device
+    )
+    dense_negative_prompt_embeds = dense_negative_prompt_embeds.to(
         device="cpu", dtype=torch.float16
-    ).contiguous()
+    )
     negative_prompt_attention_mask = negative_prompt_attention_mask.to(
         device="cpu", dtype=torch.int64
-    ).contiguous()
+    )
+    active_negative_prompt_embeds = dense_negative_prompt_embeds[
+        negative_prompt_attention_mask.bool()
+    ].contiguous()
+    (
+        negative_prompt_row_offsets,
+        active_negative_prompt_positions,
+        active_negative_prompt_input_ids,
+    ) = pack_active_metadata(negative_prompt_attention_mask, negative_tokens.input_ids)
 
-    expected_shape = (len(prompts), MAX_SEQUENCE_LENGTH, EXPECTED_HIDDEN_SIZE)
-    if tuple(prompt_embeds.shape) != expected_shape:
-        raise RuntimeError(f"Expected prompt embeddings shaped {expected_shape}, got {tuple(prompt_embeds.shape)}")
-    if tuple(negative_prompt_embeds.shape) != (1, MAX_SEQUENCE_LENGTH, EXPECTED_HIDDEN_SIZE):
-        raise RuntimeError(f"Unexpected negative embedding shape: {tuple(negative_prompt_embeds.shape)}")
-    if not torch.isfinite(prompt_embeds).all() or not torch.isfinite(negative_prompt_embeds).all():
+    expected_active = int(prompt_attention_mask.sum())
+    if tuple(active_prompt_embeds.shape) != (expected_active, EXPECTED_HIDDEN_SIZE):
+        raise RuntimeError(
+            "Expected active prompt embeddings shaped "
+            f"{(expected_active, EXPECTED_HIDDEN_SIZE)}, got {tuple(active_prompt_embeds.shape)}"
+        )
+    expected_negative_active = int(negative_prompt_attention_mask.sum())
+    if tuple(active_negative_prompt_embeds.shape) != (
+        expected_negative_active,
+        EXPECTED_HIDDEN_SIZE,
+    ):
+        raise RuntimeError(
+            f"Unexpected active negative embedding shape: {tuple(active_negative_prompt_embeds.shape)}"
+        )
+    if not torch.isfinite(active_prompt_embeds).all() or not torch.isfinite(
+        active_negative_prompt_embeds
+    ).all():
         raise RuntimeError("Export contains non-finite embeddings")
     if not torch.equal(negative_prompt_attention_mask, negative_tokens.attention_mask):
         raise RuntimeError("Negative-prompt attention-mask mismatch")
@@ -188,11 +239,17 @@ def main():
         gpu_name = torch.cuda.get_device_name(device)
 
     bundle = {
-        "format": "pixart_t2i_compbench_native_conditioning_v1",
-        "prompt_embeds": prompt_embeds,
+        "format": "pixart_t2i_compbench_active_conditioning_v2",
+        "active_prompt_embeds": active_prompt_embeds,
+        "prompt_row_offsets": prompt_row_offsets,
+        "active_prompt_positions": active_prompt_positions,
+        "active_prompt_input_ids": active_prompt_input_ids,
         "prompt_attention_mask": prompt_attention_mask,
         "prompt_input_ids": prompt_tokens.input_ids.to(dtype=torch.int64).contiguous(),
-        "negative_prompt_embeds": negative_prompt_embeds,
+        "active_negative_prompt_embeds": active_negative_prompt_embeds,
+        "negative_prompt_row_offsets": negative_prompt_row_offsets,
+        "active_negative_prompt_positions": active_negative_prompt_positions,
+        "active_negative_prompt_input_ids": active_negative_prompt_input_ids,
         "negative_prompt_attention_mask": negative_prompt_attention_mask,
         "negative_prompt_input_ids": negative_tokens.input_ids.to(dtype=torch.int64).contiguous(),
         "prompts": prompts,
@@ -203,8 +260,10 @@ def main():
         "prompt_ids": torch.tensor(prompt_ids, dtype=torch.int64),
         "metadata": {
             "created_utc": datetime.now(timezone.utc).isoformat(),
-            "artifact_type": "native_positive_and_cfg_negative_text_conditioning",
+            "artifact_type": "active_native_positive_and_cfg_negative_text_conditioning",
             "conditioning_boundary": "T5EncoderModel last_hidden_state before PixArt caption_projection",
+            "storage": "active_token_embeddings_in_row_major_prompt_and_position_order",
+            "padding_reconstruction": "zero-fill positions where prompt_attention_mask is false",
             "model": args.model,
             "model_revision": revision,
             "dataset": DATASET_ID,
@@ -214,9 +273,16 @@ def main():
             "end_index": end_index,
             "complete_validation_split": args.start_index == 0 and end_index == len(rows),
             "num_prompts": len(prompts),
+            "num_active_prompt_tokens": expected_active,
+            "num_active_negative_tokens": expected_negative_active,
             "max_sequence_length": MAX_SEQUENCE_LENGTH,
             "hidden_size": EXPECTED_HIDDEN_SIZE,
-            "embedding_dtype": str(prompt_embeds.dtype),
+            "logical_prompt_embedding_shape": [
+                len(prompts),
+                MAX_SEQUENCE_LENGTH,
+                EXPECTED_HIDDEN_SIZE,
+            ],
+            "embedding_dtype": str(active_prompt_embeds.dtype),
             "clean_caption": True,
             "preprocessing": "PixArtAlphaPipeline._text_preprocessing; clean_caption applied twice",
             "negative_prompt": negative_prompt,
@@ -236,8 +302,9 @@ def main():
 
     size_mib = args.output.stat().st_size / (1024**2)
     print(f"Saved: {args.output}")
-    print(f"Shape: {tuple(prompt_embeds.shape)}")
-    print(f"Active tokens: {int(prompt_attention_mask.sum())}")
+    print(f"Active embedding shape: {tuple(active_prompt_embeds.shape)}")
+    print(f"Logical dense shape: {(len(prompts), MAX_SEQUENCE_LENGTH, EXPECTED_HIDDEN_SIZE)}")
+    print(f"Active tokens: {expected_active}")
     print(f"Size: {size_mib:.1f} MiB")
     print(f"SHA-256: {file_digest}")
     print(f"Checksum: {checksum_path}")
