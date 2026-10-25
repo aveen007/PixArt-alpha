@@ -2,10 +2,12 @@
 # # VLM embeddings for PixArt-alpha
 #
 # This Kaggle notebook mirrors the earlier SANA projection workflow for the
-# 300 T2I-CompBench non-spatial PixArt baseline prompts. It keeps occurrence-
-# aware SEAM character-span alignment and polynomial kernel ridge regression,
-# but uses raw LLaVA language-model input embeddings as the source and native
-# PixArt T5 `last_hidden_state` token embeddings as the target.
+# 300 T2I-CompBench non-spatial PixArt baseline prompts plus 1,200 additional
+# unique T5 vocabulary token classes. It keeps occurrence-aware SEAM character-
+# span alignment and polynomial kernel ridge regression, but uses raw LLaVA
+# language-model input embeddings as the source and native PixArt T5
+# `last_hidden_state` token embeddings as the target. The added vocabulary
+# classes are training-only; evaluation still uses the exact same 300 prompts.
 
 # %%
 !pip install -U transformers accelerate sentencepiece protobuf nltk safetensors huggingface_hub
@@ -53,7 +55,7 @@ def find_one(filename):
     return matches[0]
 
 
-NATIVE_PATH = find_one("native_t5_active_tokens_fp16.pt")
+NATIVE_PATH = find_one("native_t5_active_tokens_plus_1200_vocab_fp16.pt")
 
 native = torch.load(
     NATIVE_PATH,
@@ -67,6 +69,10 @@ required_keys = {
     "prompt_row_offsets",
     "active_prompt_positions",
     "active_prompt_input_ids",
+    "extra_vocab_target_embeds",
+    "extra_vocab_token_ids",
+    "extra_vocab_texts",
+    "extra_vocab_cleaned_texts",
     "prompt_attention_mask",
     "prompt_input_ids",
     "active_negative_prompt_embeds",
@@ -83,7 +89,7 @@ required_keys = {
 
 missing = required_keys - set(native)
 assert not missing, f"Native bundle is missing keys: {sorted(missing)}"
-assert native["format"] == "pixart_t2i_compbench_active_conditioning_v2"
+assert native["format"] == "pixart_t2i_compbench_active_conditioning_v3"
 
 prompts = list(native["prompts"])
 conditioned_texts = list(native["cleaned_prompts"])
@@ -93,12 +99,21 @@ target_active = native["active_prompt_embeds"].contiguous()
 target_row_offsets = native["prompt_row_offsets"].long()
 target_active_positions = native["active_prompt_positions"].long()
 target_active_ids = native["active_prompt_input_ids"].long()
+extra_vocab_targets = native["extra_vocab_target_embeds"].contiguous()
+extra_vocab_token_ids = native["extra_vocab_token_ids"].long()
+extra_vocab_texts = list(native["extra_vocab_texts"])
+extra_vocab_cleaned_texts = list(native["extra_vocab_cleaned_texts"])
 
 assert len(prompts) == 300
 assert len(conditioned_texts) == len(prompts)
 assert target_mask.shape == (len(prompts), 120)
 assert target_ids.shape == target_mask.shape
 assert target_active.shape[1] == 4096
+assert extra_vocab_targets.shape == (1200, 4096)
+assert extra_vocab_token_ids.shape == (1200,)
+assert len(extra_vocab_texts) == len(extra_vocab_cleaned_texts) == 1200
+assert len(torch.unique(extra_vocab_token_ids)) == 1200
+assert not set(extra_vocab_token_ids.tolist()).intersection(target_active_ids.tolist())
 assert int(target_row_offsets[-1]) == len(target_active)
 assert len(target_row_offsets) == len(prompts) + 1
 
@@ -121,6 +136,8 @@ print("Native file:", NATIVE_PATH)
 print("Native format:", native["format"])
 print("Prompts:", len(prompts))
 print("Active target tokens:", len(target_active))
+print("Unique prompt token IDs:", len(torch.unique(target_active_ids)))
+print("Additional vocabulary token IDs:", len(extra_vocab_token_ids))
 print("Target active shape:", tuple(target_active.shape))
 print("Logical shape:", native["metadata"]["logical_prompt_embedding_shape"])
 
@@ -165,9 +182,32 @@ assert torch.equal(target_encoded["attention_mask"].bool(), target_mask)
 target_offsets = target_encoded["offset_mapping"].long()
 target_special_mask = target_encoded["special_tokens_mask"].bool()
 
+extra_target_encoded = target_tokenizer(
+    extra_vocab_cleaned_texts,
+    add_special_tokens=False,
+    padding=False,
+    truncation=False,
+    return_offsets_mapping=True,
+)
+for row_index, (token_ids, offsets, expected_id) in enumerate(zip(
+    extra_target_encoded["input_ids"],
+    extra_target_encoded["offset_mapping"],
+    extra_vocab_token_ids.tolist(),
+)):
+    assert token_ids == [expected_id], (
+        f"Extra vocabulary row {row_index} no longer round-trips to token {expected_id}"
+    )
+    assert len(offsets) == 1 and offsets[0][1] > offsets[0][0]
+
+extra_target_offsets = torch.tensor(
+    [offsets[0] for offsets in extra_target_encoded["offset_mapping"]],
+    dtype=torch.int64,
+)
+
 active_special_count = int(target_special_mask[target_mask].sum())
 print("Exact target tokenization verified")
 print("Active special tokens:", active_special_count)
+print("Extra single-token targets verified:", len(extra_vocab_token_ids))
 
 # %% [markdown]
 # ## Load only LLaVA's raw language-model input embedding table
@@ -441,8 +481,99 @@ def extract_seam_pairs():
     }
 
 
+@torch.inference_mode()
+def extract_extra_vocab_seam_pairs():
+    """SEAM-align the 1,200 isolated T5 vocabulary target occurrences."""
+    x_parts = []
+    fallback_parts = []
+    alignment_row_offsets = [0]
+    alignment_source_positions = []
+    alignment_source_weights = []
+
+    for batch_start in tqdm(
+        range(0, len(extra_vocab_cleaned_texts), SOURCE_BATCH_SIZE),
+        desc="SEAM-aligning extra T5 vocabulary tokens",
+    ):
+        batch_end = min(
+            batch_start + SOURCE_BATCH_SIZE,
+            len(extra_vocab_cleaned_texts),
+        )
+        batch_texts = extra_vocab_cleaned_texts[batch_start:batch_end]
+        encoded = source_tokenizer(
+            batch_texts,
+            add_special_tokens=True,
+            padding=True,
+            truncation=False,
+            return_attention_mask=True,
+            return_offsets_mapping=True,
+            return_special_tokens_mask=True,
+            return_tensors="pt",
+        )
+
+        source_ids = encoded["input_ids"]
+        source_attention = encoded["attention_mask"].bool()
+        source_offsets = encoded["offset_mapping"].long()
+        source_special = encoded["special_tokens_mask"].bool()
+        source_lookup = source_embedding_table[source_ids]
+
+        for local_index, _ in enumerate(batch_texts):
+            vocab_index = batch_start + local_index
+            row_attention = source_attention[local_index]
+            row_offsets = source_offsets[local_index]
+            source_regular_indices = torch.nonzero(
+                row_attention
+                & ~source_special[local_index]
+                & (row_offsets[:, 1] > row_offsets[:, 0]),
+                as_tuple=False,
+            ).flatten()
+            assert len(source_regular_indices), "No regular LLaVA token found"
+
+            target_span = extra_target_offsets[vocab_index]
+            source_spans = row_offsets[source_regular_indices]
+            overlap_start = torch.maximum(target_span[0], source_spans[:, 0])
+            overlap_end = torch.minimum(target_span[1], source_spans[:, 1])
+            overlap = (overlap_end - overlap_start).clamp_min(0).float()
+            fallback = bool(overlap.sum() == 0)
+            if fallback:
+                target_center = target_span.float().mean()
+                source_centers = source_spans.float().mean(dim=1)
+                nearest = torch.argmin(torch.abs(source_centers - target_center))
+                overlap[nearest] = 1.0
+
+            weights = overlap / overlap.sum().clamp_min(1)
+            aligned = weights @ source_lookup[
+                local_index,
+                source_regular_indices,
+            ].float()
+            used = torch.nonzero(weights > 0, as_tuple=False).flatten()
+            used_positions = source_regular_indices[used]
+
+            x_parts.append(aligned[None].to(torch.float16))
+            fallback_parts.append(fallback)
+            alignment_source_positions.extend(used_positions.tolist())
+            alignment_source_weights.extend(weights[used].tolist())
+            alignment_row_offsets.append(len(alignment_source_positions))
+
+    return {
+        "X": torch.cat(x_parts).contiguous(),
+        "Y": extra_vocab_targets.to(torch.float16).contiguous(),
+        "token_ids": extra_vocab_token_ids.contiguous(),
+        "alignment_fallback_mask": torch.tensor(fallback_parts, dtype=torch.bool),
+        "alignment_row_offsets": torch.tensor(alignment_row_offsets, dtype=torch.int64),
+        "alignment_source_positions": torch.tensor(
+            alignment_source_positions,
+            dtype=torch.int32,
+        ),
+        "alignment_source_weights": torch.tensor(
+            alignment_source_weights,
+            dtype=torch.float32,
+        ),
+    }
+
+
 alignment_start = time.perf_counter()
 pairs = extract_seam_pairs()
+extra_pairs = extract_extra_vocab_seam_pairs()
 alignment_seconds = time.perf_counter() - alignment_start
 
 X_all = pairs["X"]
@@ -457,11 +588,25 @@ assert int(pairs["alignment_row_offsets"][-1]) == len(
 )
 assert torch.equal(pair_prompt_indices.long(), mask_coordinates[:, 0])
 assert torch.equal(pair_target_positions.long(), mask_coordinates[:, 1])
+assert extra_pairs["X"].shape == extra_pairs["Y"].shape == (1200, 4096)
+assert torch.equal(extra_pairs["token_ids"], extra_vocab_token_ids)
+assert len(extra_pairs["alignment_row_offsets"]) == len(extra_pairs["X"]) + 1
 
-PAIR_PATH = Path("/kaggle/working/pixart_llava_compbench_seam_pairs.pt")
+PAIR_PATH = Path(
+    "/kaggle/working/pixart_llava_compbench_plus_1200_vocab_seam_pairs.pt"
+)
 pair_bundle = {
-    "format": "pixart_llava_compbench_seam_pairs_v1",
+    "format": "pixart_llava_compbench_seam_pairs_v2",
     **pairs,
+    "extra_vocab_X": extra_pairs["X"],
+    "extra_vocab_Y": extra_pairs["Y"],
+    "extra_vocab_token_ids": extra_pairs["token_ids"],
+    "extra_vocab_texts": extra_vocab_texts,
+    "extra_vocab_cleaned_texts": extra_vocab_cleaned_texts,
+    "extra_vocab_alignment_fallback_mask": extra_pairs["alignment_fallback_mask"],
+    "extra_vocab_alignment_row_offsets": extra_pairs["alignment_row_offsets"],
+    "extra_vocab_alignment_source_positions": extra_pairs["alignment_source_positions"],
+    "extra_vocab_alignment_source_weights": extra_pairs["alignment_source_weights"],
     "target_input_ids": target_ids,
     "target_attention_mask": target_mask,
     "active_target_input_ids": target_active_ids,
@@ -479,12 +624,20 @@ torch.save(pair_bundle, PAIR_PATH)
 
 print("Aligned pairs:", tuple(X_all.shape), tuple(Y_all.shape))
 print("Fallbacks:", int(pairs["alignment_fallback_mask"].sum()))
+print("Extra vocabulary pairs:", tuple(extra_pairs["X"].shape))
+print(
+    "Extra vocabulary fallbacks:",
+    int(extra_pairs["alignment_fallback_mask"].sum()),
+)
 print("Alignment seconds:", round(alignment_seconds, 2))
 print("Saved:", PAIR_PATH)
 display(FileLink(str(PAIR_PATH)))
 
 # %% [markdown]
-# ## Keep one deterministic occurrence per unique target T5 token ID
+# ## Build the augmented unique-token fitting dictionary
+#
+# Keep one deterministic occurrence for each token ID present in the 300
+# prompts, then append the 1,200 disjoint vocabulary-only token classes.
 
 # %%
 all_pair_token_ids = target_ids[
@@ -499,20 +652,34 @@ for occurrence_row, token_id in enumerate(all_pair_token_ids.tolist()):
     if token_id not in first_row_by_token_id:
         first_row_by_token_id[token_id] = occurrence_row
 
-fit_rows = torch.tensor(
+prompt_fit_rows = torch.tensor(
     list(first_row_by_token_id.values()),
     dtype=torch.long,
 )
 
 heldout_mask = torch.ones(len(X_all), dtype=torch.bool)
-heldout_mask[fit_rows] = False
+heldout_mask[prompt_fit_rows] = False
 heldout_rows = torch.nonzero(heldout_mask, as_tuple=False).flatten()
 
-X_cpu = X_all.index_select(0, fit_rows).contiguous()
-Y_cpu = Y_all.index_select(0, fit_rows).contiguous()
-fit_token_ids = all_pair_token_ids.index_select(0, fit_rows).contiguous()
+prompt_fit_token_ids = all_pair_token_ids.index_select(
+    0,
+    prompt_fit_rows,
+).contiguous()
+X_cpu = torch.cat([
+    X_all.index_select(0, prompt_fit_rows),
+    extra_pairs["X"],
+]).contiguous()
+Y_cpu = torch.cat([
+    Y_all.index_select(0, prompt_fit_rows),
+    extra_pairs["Y"],
+]).contiguous()
+fit_token_ids = torch.cat([
+    prompt_fit_token_ids,
+    extra_pairs["token_ids"],
+]).contiguous()
 
 assert len(torch.unique(fit_token_ids)) == len(fit_token_ids)
+assert len(X_cpu) == len(prompt_fit_rows) + 1200
 
 del source_embedding_table
 gc.collect()
@@ -521,7 +688,9 @@ if torch.cuda.is_available():
 
 kernel_gib = len(X_cpu) * len(X_cpu) * 4 / 1024**3
 print("All aligned occurrences:", len(X_all))
-print("Unique fitting token IDs:", len(X_cpu))
+print("Unique prompt fitting token IDs:", len(prompt_fit_rows))
+print("Additional vocabulary token IDs:", len(extra_pairs["X"]))
+print("Total unique fitting token IDs:", len(X_cpu))
 print("Repeated held-out occurrences:", len(heldout_rows))
 print("Expected float32 kernel:", round(kernel_gib, 3), "GiB")
 
@@ -760,8 +929,9 @@ def predict_norms(source_rows, batch_size=256):
 all_predicted_norms = predict_norms(X_all)
 projected_active = normalize_rows(all_direction_cpu.float()) * all_predicted_norms
 
-fit_projected = projected_active.index_select(0, fit_rows)
-train_norm_metrics = norm_metrics(fit_projected, Y_all.index_select(0, fit_rows))
+fit_predicted_norms = predict_norms(X_cpu)
+fit_projected = fit_direction.cpu() * fit_predicted_norms
+train_norm_metrics = norm_metrics(fit_projected, Y_cpu)
 
 if len(heldout_rows):
     heldout_norm_metrics = norm_metrics(
@@ -783,13 +953,15 @@ print("Projected active shape:", tuple(projected_active.shape))
 # `active_prompt_embeds` is replaced.
 
 # %%
-PROJECTOR_PATH = Path("/kaggle/working/pixart_llava_compbench_projector.pt")
+PROJECTOR_PATH = Path(
+    "/kaggle/working/pixart_llava_compbench_plus_1200_vocab_projector.pt"
+)
 PROJECTED_PATH = Path(
-    "/kaggle/working/pixart_llava_compbench_projected_active_fp16.pt"
+    "/kaggle/working/pixart_llava_compbench_projected_plus_1200_vocab_active_fp16.pt"
 )
 
 projector_bundle = {
-    "format": "pixart_llava_polynomial_krr_projector_v1",
+    "format": "pixart_llava_polynomial_krr_projector_v2",
     "source_model": SOURCE_MODEL_ID,
     "source_representation": "raw_language_model_input_embedding_lookup",
     "source_embedding_key": embedding_key,
@@ -797,15 +969,25 @@ projector_bundle = {
     "target_model_revision": target_revision,
     "target_representation": "PixArt_T5_last_hidden_state_before_caption_projection",
     "alignment": "SEAM_character_overlap_weighted_occurrence_aware",
-    "alignment_fallback_count": int(pairs["alignment_fallback_mask"].sum()),
+    "alignment_fallback_count": int(pairs["alignment_fallback_mask"].sum())
+    + int(extra_pairs["alignment_fallback_mask"].sum()),
     "calculation_prompt_count": len(prompts),
     "aligned_occurrence_count": len(X_all),
-    "training_pair_policy": "first_occurrence_per_unique_target_token_id",
+    "extra_vocab_token_count": len(extra_pairs["X"]),
+    "training_pair_policy": (
+        "first_prompt_occurrence_per_unique_target_token_id_plus_1200_disjoint_"
+        "isolated_vocabulary_token_classes"
+    ),
     "training_pair_count": len(X_cpu),
-    "training_rows": fit_rows,
+    "training_prompt_rows": prompt_fit_rows,
     "training_token_ids": fit_token_ids,
-    "training_prompt_indices": pair_prompt_indices.index_select(0, fit_rows),
-    "training_target_positions": pair_target_positions.index_select(0, fit_rows),
+    "training_prompt_token_ids": prompt_fit_token_ids,
+    "training_extra_vocab_token_ids": extra_pairs["token_ids"],
+    "training_prompt_indices": pair_prompt_indices.index_select(0, prompt_fit_rows),
+    "training_target_positions": pair_target_positions.index_select(
+        0,
+        prompt_fit_rows,
+    ),
     "X_norm_mean": X_norm_mean.cpu(),
     "train_features": X_norm.cpu(),
     "kernel": {
@@ -830,8 +1012,9 @@ projector_bundle = {
     "repeated_occurrence_norm_metrics": heldout_norm_metrics,
     "fit_seconds": fit_seconds,
     "evaluation_note": (
-        "Sanity check on the same 300-prompt vocabulary; repeated occurrences "
-        "are not an independent vocabulary split."
+        "The generated conditioning and evaluation prompts are the same 300-row "
+        "baseline split. The fitting dictionary additionally contains 1,200 "
+        "disjoint T5 vocabulary token classes."
     ),
 }
 
@@ -847,6 +1030,8 @@ projected_bundle["metadata"].update({
     "projector_format": projector_bundle["format"],
     "projector_training_pair_count": len(X_cpu),
     "projector_training_prompt_count": len(prompts),
+    "projector_prompt_vocabulary_token_count": len(prompt_fit_rows),
+    "projector_extra_vocab_token_count": len(extra_pairs["X"]),
     "projector_uses_same_baseline_prompt_set": True,
     "native_cfg_negative_preserved": True,
 })

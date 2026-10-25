@@ -3,7 +3,9 @@
 The portable torch bundle stores only embeddings at positions where the T5
 attention mask is active. It retains masks, token IDs, sequence positions,
 row offsets, and the active empty-prompt conditioning used by Diffusers for
-CFG. Masked padding embeddings are intentionally omitted.
+CFG. Masked padding embeddings are intentionally omitted. Optionally, it also
+stores a compact set of contextual targets for additional T5 vocabulary token
+classes used only to fit the VLM-to-T5 projector.
 """
 
 import argparse
@@ -46,6 +48,15 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--end-index", type=int, default=300)
+    parser.add_argument(
+        "--extra-vocab-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Add this many unique non-special T5 vocabulary token classes as "
+            "single-token contextual targets for projector training"
+        ),
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -111,10 +122,68 @@ def reconstruct_dense(active_embeddings, attention_mask):
     return dense
 
 
+def select_extra_vocab_entries(pipe, excluded_token_ids, count):
+    """Choose deterministic, exactly round-tripping lexical T5 token classes."""
+    if count == 0:
+        return [], [], []
+
+    tokenizer = pipe.tokenizer
+    excluded = {int(token_id) for token_id in excluded_token_ids}
+    excluded.update(int(token_id) for token_id in tokenizer.all_special_ids)
+    selected_ids = []
+    selected_texts = []
+    selected_cleaned_texts = []
+
+    # SentencePiece vocabulary IDs are ordered by the tokenizer vocabulary.
+    # Taking the first eligible IDs favors common lexical pieces while the
+    # round-trip condition guarantees one unambiguous T5 target occurrence.
+    for token_id in range(len(tokenizer)):
+        if token_id in excluded:
+            continue
+
+        text = tokenizer.decode(
+            [token_id],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        if not text or not text.strip():
+            continue
+
+        cleaned_text = pipe._text_preprocessing([text], clean_caption=True)[0]
+        if not cleaned_text or not cleaned_text.strip():
+            continue
+
+        encoded = tokenizer(
+            cleaned_text,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+        if encoded["input_ids"] != [token_id]:
+            continue
+        start, end = encoded["offset_mapping"][0]
+        if end <= start:
+            continue
+
+        selected_ids.append(token_id)
+        selected_texts.append(text)
+        selected_cleaned_texts.append(cleaned_text)
+        if len(selected_ids) == count:
+            break
+
+    if len(selected_ids) != count:
+        raise RuntimeError(
+            f"Requested {count} extra vocabulary tokens, but only found "
+            f"{len(selected_ids)} eligible round-tripping tokens"
+        )
+    return selected_ids, selected_texts, selected_cleaned_texts
+
+
 def main():
     args = parse_args()
     if args.batch_size < 1:
         raise ValueError("--batch-size must be at least 1")
+    if args.extra_vocab_tokens < 0:
+        raise ValueError("--extra-vocab-tokens cannot be negative")
     if args.output.exists() and not args.overwrite:
         raise FileExistsError(f"{args.output} already exists; pass --overwrite to replace it")
 
@@ -192,6 +261,65 @@ def main():
         prompt_attention_mask, prompt_tokens.input_ids
     )
 
+    (
+        extra_vocab_token_ids,
+        extra_vocab_texts,
+        extra_vocab_cleaned_texts,
+    ) = select_extra_vocab_entries(
+        pipe,
+        excluded_token_ids=active_prompt_input_ids.tolist(),
+        count=args.extra_vocab_tokens,
+    )
+    extra_vocab_embedding_batches = []
+    if extra_vocab_token_ids:
+        extra_vocab_tokens = pipe.tokenizer(
+            extra_vocab_cleaned_texts,
+            padding="max_length",
+            max_length=MAX_SEQUENCE_LENGTH,
+            truncation=True,
+            add_special_tokens=True,
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+        expected_extra_ids = torch.tensor(extra_vocab_token_ids, dtype=torch.int64)
+        if not torch.equal(extra_vocab_tokens.input_ids[:, 0], expected_extra_ids):
+            raise RuntimeError("Extra-vocabulary token IDs did not remain at target position zero")
+
+        for offset in tqdm(
+            range(0, len(extra_vocab_texts), args.batch_size),
+            desc="Encoding extra vocabulary tokens",
+        ):
+            batch = extra_vocab_texts[offset : offset + args.batch_size]
+            batch_embeds, batch_mask = encode(pipe, batch, device)
+            expected_mask = extra_vocab_tokens.attention_mask[offset : offset + len(batch)]
+            if not torch.equal(batch_mask.cpu(), expected_mask):
+                raise RuntimeError(
+                    f"Extra-vocabulary mask mismatch in batch starting at token {offset}"
+                )
+            extra_vocab_embedding_batches.append(
+                batch_embeds[:, 0].to(device="cpu", dtype=torch.float16).contiguous()
+            )
+        extra_vocab_target_embeds = torch.cat(extra_vocab_embedding_batches, dim=0)
+    else:
+        extra_vocab_target_embeds = torch.empty(
+            (0, EXPECTED_HIDDEN_SIZE),
+            dtype=torch.float16,
+        )
+
+    extra_vocab_token_ids_tensor = torch.tensor(extra_vocab_token_ids, dtype=torch.int64)
+    if tuple(extra_vocab_target_embeds.shape) != (
+        args.extra_vocab_tokens,
+        EXPECTED_HIDDEN_SIZE,
+    ):
+        raise RuntimeError(
+            "Unexpected extra-vocabulary embedding shape: "
+            f"{tuple(extra_vocab_target_embeds.shape)}"
+        )
+    if len(torch.unique(extra_vocab_token_ids_tensor)) != len(extra_vocab_token_ids_tensor):
+        raise RuntimeError("Extra-vocabulary token IDs are not unique")
+    if set(extra_vocab_token_ids).intersection(active_prompt_input_ids.tolist()):
+        raise RuntimeError("Extra-vocabulary token IDs overlap the evaluation prompt vocabulary")
+
     negative_prompt = ""
     cleaned_negative_prompt = pipe._text_preprocessing([negative_prompt], clean_caption=True)
     negative_tokens = tokenize(pipe, cleaned_negative_prompt)
@@ -227,9 +355,11 @@ def main():
         raise RuntimeError(
             f"Unexpected active negative embedding shape: {tuple(active_negative_prompt_embeds.shape)}"
         )
-    if not torch.isfinite(active_prompt_embeds).all() or not torch.isfinite(
-        active_negative_prompt_embeds
-    ).all():
+    if (
+        not torch.isfinite(active_prompt_embeds).all()
+        or not torch.isfinite(extra_vocab_target_embeds).all()
+        or not torch.isfinite(active_negative_prompt_embeds).all()
+    ):
         raise RuntimeError("Export contains non-finite embeddings")
     if not torch.equal(negative_prompt_attention_mask, negative_tokens.attention_mask):
         raise RuntimeError("Negative-prompt attention-mask mismatch")
@@ -239,11 +369,15 @@ def main():
         gpu_name = torch.cuda.get_device_name(device)
 
     bundle = {
-        "format": "pixart_t2i_compbench_active_conditioning_v2",
+        "format": "pixart_t2i_compbench_active_conditioning_v3",
         "active_prompt_embeds": active_prompt_embeds,
         "prompt_row_offsets": prompt_row_offsets,
         "active_prompt_positions": active_prompt_positions,
         "active_prompt_input_ids": active_prompt_input_ids,
+        "extra_vocab_target_embeds": extra_vocab_target_embeds,
+        "extra_vocab_token_ids": extra_vocab_token_ids_tensor,
+        "extra_vocab_texts": extra_vocab_texts,
+        "extra_vocab_cleaned_texts": extra_vocab_cleaned_texts,
         "prompt_attention_mask": prompt_attention_mask,
         "prompt_input_ids": prompt_tokens.input_ids.to(dtype=torch.int64).contiguous(),
         "active_negative_prompt_embeds": active_negative_prompt_embeds,
@@ -274,6 +408,14 @@ def main():
             "complete_validation_split": args.start_index == 0 and end_index == len(rows),
             "num_prompts": len(prompts),
             "num_active_prompt_tokens": expected_active,
+            "extra_vocab_token_count": len(extra_vocab_token_ids),
+            "extra_vocab_selection": (
+                "lowest_vocabulary_ids_excluding_prompt_and_special_ids_with_exact_"
+                "single_token_roundtrip_after_pixart_cleaning"
+            ),
+            "extra_vocab_target_context": (
+                "T5EncoderModel last_hidden_state at position zero for the isolated token text"
+            ),
             "num_active_negative_tokens": expected_negative_active,
             "max_sequence_length": MAX_SEQUENCE_LENGTH,
             "hidden_size": EXPECTED_HIDDEN_SIZE,
@@ -305,6 +447,7 @@ def main():
     print(f"Active embedding shape: {tuple(active_prompt_embeds.shape)}")
     print(f"Logical dense shape: {(len(prompts), MAX_SEQUENCE_LENGTH, EXPECTED_HIDDEN_SIZE)}")
     print(f"Active tokens: {expected_active}")
+    print(f"Extra vocabulary token classes: {len(extra_vocab_token_ids)}")
     print(f"Size: {size_mib:.1f} MiB")
     print(f"SHA-256: {file_digest}")
     print(f"Checksum: {checksum_path}")
