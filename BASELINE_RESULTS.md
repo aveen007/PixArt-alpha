@@ -7,6 +7,7 @@
 | PixArt-alpha paper | 300 | Multiple (official protocol) | **0.3179** | Not reported | N/A | N/A |
 | Local baseline pilot | 300 | 1 | **0.3098** | 0.0273 | -0.0081 | -2.55% |
 | LLaVA-to-T5 projected conditioning | 300 | 1 | **0.2984** | 0.0301 | -0.0195 | -6.14% |
+| LLaVA-to-T5 projected + 1,200 T5 vocabulary classes | 300 | 1 | **0.2999** | 0.0287 | -0.0180 | -5.67% |
 
 The local baseline is close to the reported result, but it is not an exact
 reproduction. It uses one generated image per prompt, whereas the official
@@ -18,6 +19,12 @@ With all generation and scoring settings matched, projected conditioning is
 0.0114 below the local native-T5 baseline, a 3.68% relative decrease. The
 projected result used compact active-token artifact SHA-256
 `0b73c0953ae50a1958a31e4f438ddc94e6cccaa00689530858c94c45a208be8c`.
+
+Adding 1,200 disjoint T5 vocabulary classes increased the projected score by
+0.0015 (0.50%) and closed 13.02% of the original gap to the native baseline.
+The augmented projection remains 0.0099 below native T5, a 3.20% relative
+decrease. Its compact artifact SHA-256 is
+`65cf9b5be2a2b7fec653a2f8dff68fcc1b69ba96ae0438970ed70c48db03994d`.
 
 ### Run details
 
@@ -40,6 +47,7 @@ projected result used compact active-token artifact SHA-256
 | Evaluation script | `tools/eval_t2i_compbench_nonspatial.py` |
 | Native baseline summary | `output/pixart_compbench_nonspatial/clip_summary.json` |
 | Projected summary | `output/pixart_compbench_nonspatial_projected/clip_summary.json` |
+| Projected + 1,200 vocabulary summary | `output/pixart_compbench_nonspatial_projected_plus_1200_vocab/clip_summary.json` |
 
 The Diffusers loader reported that `caption_projection.y_embedding` was not
 used. This is another reason to regard this result as a lightweight reference
