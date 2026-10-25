@@ -156,12 +156,8 @@ def select_extra_vocab_entries(pipe, excluded_token_ids, count):
         encoded = tokenizer(
             cleaned_text,
             add_special_tokens=False,
-            return_offsets_mapping=True,
         )
         if encoded["input_ids"] != [token_id]:
-            continue
-        start, end = encoded["offset_mapping"][0]
-        if end <= start:
             continue
 
         selected_ids.append(token_id)
